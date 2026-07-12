@@ -1,0 +1,375 @@
+<?php
+require __DIR__ . '/../../../vendor/autoload.php';
+
+use Ratchet\MessageComponentInterface;
+use Ratchet\ConnectionInterface;
+use Ratchet\Server\IoServer;
+use Ratchet\Http\HttpServer;
+use Ratchet\WebSocket\WsServer;
+
+use SolutionForest\OcppPhp\Ocpp\v16\Database;
+use SolutionForest\OcppPhp\Ocpp\v16\EventManager;
+use SolutionForest\OcppPhp\Ocpp\v16\ConnectorManager;
+use SolutionForest\OcppPhp\Ocpp\v16\TransactionManager;
+
+class CSMS implements MessageComponentInterface
+{
+    private string $logFile = __DIR__ . "/csms.log";
+
+    private $db;
+    private $portalPdo;
+    private EventManager $events;
+    private ConnectorManager $connectors;
+    private TransactionManager $transactions;
+
+    private array $lastHeartbeatLogTime = [];
+
+    public function __construct()
+    {
+        try {
+            $this->db          = new Database();
+            $this->events      = new EventManager();
+            $this->connectors  = new ConnectorManager();
+            $this->transactions= new TransactionManager();
+
+            $this->portalPdo = new PDO(
+                "mysql:host=localhost;dbname=ocpp_system;charset=utf8mb4",
+                "srajf",
+                "Passw0rd",
+                [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                ]
+            );
+        } catch (\Exception $e) {
+            $this->csmsLog("Greška pri inicijalizaciji baze: " . $e->getMessage());
+            exit;
+        }
+    }
+
+    private function csmsLog(string $msg): void
+    {
+        $line = "[" . date("Y-m-d H:i:s") . "] " . $msg . "\n";
+        echo $line;
+        @file_put_contents($this->logFile, $line, FILE_APPEND);
+    }
+
+    private function punionicaExists(int $idPunionice): bool
+    {
+        $stmt = $this->portalPdo->prepare("SELECT 1 FROM Punionica WHERE ID = :id LIMIT 1");
+        $stmt->execute([':id' => $idPunionice]);
+        return (bool)$stmt->fetch();
+    }
+
+    private function findStatusIdByName(string $name): ?int
+    {
+        $stmt = $this->portalPdo->prepare("SELECT ID FROM Status WHERE Naziv = :n LIMIT 1");
+        $stmt->execute([':n' => $name]);
+        $row = $stmt->fetch();
+        return $row ? (int)$row['ID'] : null;
+    }
+
+    private function getLastStatusIdForPunionica(int $idPunionice): ?int
+    {
+        $stmt = $this->portalPdo->prepare("
+            SELECT ID_Status
+            FROM Status_Punionice
+            WHERE ID_Punionice = :pid
+            ORDER BY VrijemePostavljanja DESC
+            LIMIT 1
+        ");
+        $stmt->execute([':pid' => $idPunionice]);
+        $row = $stmt->fetch();
+        return $row ? (int)$row['ID_Status'] : null;
+    }
+
+    // više ne upisujemo statuse u Status_Punionice iz CSMS-a
+    private function saveStatusToPortal(array $payload): void
+    {
+        return;
+    }
+
+    private function processPendingCommands(int $cpId, ConnectionInterface $connection): void
+    {
+        if (!$this->punionicaExists($cpId)) return;
+
+        $stmt = $this->portalPdo->prepare("
+            SELECT ID, Naredba, Parametar
+            FROM Naredbe
+            WHERE ID_Punionice = :pid AND Id_status = 1
+            ORDER BY Vrijeme ASC
+            LIMIT 1
+        ");
+        $stmt->execute([':pid' => $cpId]);
+        $cmd = $stmt->fetch();
+
+        if (!$cmd) return;
+
+        $messageId = uniqid('srv_', true);
+
+        $out = [
+            2,
+            $messageId,
+            $cmd['Naredba'],
+            [
+                'connectorId'   => 1,
+                'chargePointId' => $cpId,
+                'parametar'     => $cmd['Parametar'],
+            ],
+        ];
+
+        $this->csmsLog("[PORTAL] Slanje naredbe CP-u $cpId: " . json_encode($out));
+        $connection->send(json_encode($out));
+
+        $stmt = $this->portalPdo->prepare("UPDATE Naredbe SET Id_status = 2 WHERE ID = :id");
+        $stmt->execute([':id' => $cmd['ID']]);
+    }
+
+    private function logPortalEvent(string $eventType, array $payload, string $status, ?int $cpId = null): void
+    {
+        try {
+            $poruka = json_encode([
+                'event'   => $eventType,
+                'status'  => $status,
+                'cpId'    => $cpId,
+                'payload' => $payload,
+            ], JSON_UNESCAPED_UNICODE);
+
+            $sql = "INSERT INTO logovi (vrijeme, chargingStation, poruka)
+                    VALUES (NOW(), :chargingStation, :poruka)";
+            $stmt = $this->portalPdo->prepare($sql);
+            $stmt->execute([
+                ':chargingStation' => (string)($cpId ?? $eventType),
+                ':poruka'          => $poruka,
+            ]);
+        } catch (\Exception $e) {
+            $this->csmsLog("[PORTAL] DB error: " . $e->getMessage());
+        }
+    }
+
+    public function onOpen(ConnectionInterface $conn)
+    {
+        $path = trim($conn->httpRequest->getUri()->getPath(), "/");
+        $cpId = (int)$path;
+        $conn->cpId = $cpId;
+
+        $this->csmsLog("Nova konekcija: {$conn->remoteAddress} (Punionica ID: $cpId)");
+    }
+
+    public function onMessage(ConnectionInterface $from, $msg)
+    {
+        $data = json_decode($msg, true);
+        if (!$data) {
+            $this->csmsLog("Nevaljali JSON primljen: $msg");
+            return;
+        }
+
+        $action    = null;
+        $payload   = [];
+        $messageId = null;
+
+        if (isset($data['action'])) {
+            $action    = $data['action'];
+            $payload   = $data['payload'] ?? [];
+            $messageId = $data['messageId'] ?? uniqid("json_", true);
+        } elseif (isset($data[2])) {
+            $messageId = $data[1];
+            $action    = $data[2];
+            $payload   = $data[3] ?? [];
+        }
+
+        if (!$action) return;
+
+        $cpId = isset($from->cpId) ? (int)$from->cpId : (int)($payload['chargePointId'] ?? 0);
+        if ($cpId <= 0) {
+            $this->csmsLog("[UNKNOWN] Action: $action (nepoznat CP ID)");
+            return;
+        }
+
+        $this->csmsLog("[CP-$cpId] Action: $action");
+
+        $this->logEventToDatabase("Call", $action, $payload, $cpId);
+
+        $this->onAction($from, $action, $payload, $messageId, $cpId);
+    }
+
+    private function onAction(ConnectionInterface $from, string $action, array $payload, string $messageId, int $cpId): void
+    {
+        switch ($action) {
+            case "BootNotification":
+                if (!$this->punionicaExists($cpId)) {
+                    $this->csmsLog("[BOOT] Punionica ID $cpId ne postoji u bazi.");
+                }
+
+                $from->send(json_encode([
+                    3,
+                    $messageId,
+                    [
+                        "status"      => "Accepted",
+                        "currentTime" => date("c"),
+                        "interval"    => 300,
+                    ]
+                ]));
+
+                $this->logPortalEvent('BootNotification', $payload, 'OK', $cpId);
+                break;
+
+            case "StatusNotification":
+                // ako nema status polja – ne radimo ništa, ne pretvaramo u Available
+                if (!isset($payload["status"])) {
+                    $this->csmsLog("[CP-$cpId] StatusNotification bez status polja – ignoriram za status logiku");
+                    $from->send(json_encode([3, $messageId, (object)[]]));
+                    $this->logPortalEvent('StatusNotification', $payload, 'NO_STATUS', $cpId);
+                    break;
+                }
+
+                $this->updateOcppStatus($cpId, $payload);
+
+                // više ne upisujemo u Status_Punionice iz CSMS-a
+                $this->saveStatusToPortal([
+                    'status'        => $payload['status'],
+                    'chargePointId' => $cpId,
+                    'userId'        => $payload['userId'] ?? null,
+                ]);
+
+                $from->send(json_encode([3, $messageId, (object)[]]));
+                $this->logPortalEvent('StatusNotification', $payload, 'OK', $cpId);
+                break;
+
+            case "Heartbeat":
+                $this->csmsLog("[CP-$cpId] HEARTBEAT primljen");
+
+                $from->send(json_encode([3, $messageId, ["currentTime" => date("c")]]));
+
+                $now  = time();
+                $last = $this->lastHeartbeatLogTime[$cpId] ?? 0;
+                if ($now - $last >= 1) {
+                    $this->logPortalEvent('Heartbeat', $payload, 'OK', $cpId);
+                    $this->lastHeartbeatLogTime[$cpId] = $now;
+                }
+
+                $this->processPendingCommands($cpId, $from);
+                break;
+
+            case "StartTransaction":
+                $this->handleStartTransaction($cpId, $payload);
+                $from->send(json_encode([
+                    3,
+                    $messageId,
+                    [
+                        "transactionId" => rand(1000, 9999),
+                        "idTagInfo"     => ["status" => "Accepted"]
+                    ]
+                ]));
+                $this->logPortalEvent('StartTransaction', $payload, 'OK', $cpId);
+                break;
+
+            case "StopTransaction":
+                $this->handleStopTransaction($payload);
+                $from->send(json_encode([
+                    3,
+                    $messageId,
+                    [
+                        "idTagInfo" => ["status" => "Accepted"]
+                    ]
+                ]));
+                $this->logPortalEvent('StopTransaction', $payload, 'OK', $cpId);
+                break;
+        }
+    }
+
+    private function updateOcppStatus(int $cpId, array $payload): void
+    {
+        if (!isset($payload['status'])) {
+            return;
+        }
+
+        $statusMap = [
+            "Available"     => 1,
+            "Preparing"     => 2,
+            "Charging"      => 3,
+            "SuspendedEV"   => 4,
+            "SuspendedEVSE" => 5,
+            "Finishing"     => 6,
+            "Faulted"       => 7,
+            "Reserved"      => 8,
+            "Unavailable"   => 9,
+        ];
+
+        $statusName = $payload['status'];
+        if (!isset($statusMap[$statusName])) {
+            $this->csmsLog("[CP-$cpId] Nepoznat status '$statusName' – ignoriram updateOcppStatus");
+            return;
+        }
+
+        $sid         = $statusMap[$statusName];
+        $connectorId = $payload['connectorId'] ?? 1;
+
+        $this->db->query(
+            "INSERT INTO connectors (chargepoint_id, connector_id, status_id, last_update)
+             VALUES (?,?,?,NOW())
+             ON DUPLICATE KEY UPDATE status_id=VALUES(status_id), last_update=NOW()",
+            [$cpId, $connectorId, $sid]
+        );
+    }
+
+    private function handleStartTransaction(int $cpId, array $payload): void
+    {
+        $connectorId = $payload['connectorId'] ?? 1;
+        $timestamp   = $payload['timestamp'] ?? date("c");
+        $meterStart  = $payload['meterStart'] ?? 0;
+
+        $this->db->query(
+            "INSERT INTO transactions (chargepoint_id, connector_id, start_time, meter_start, status)
+             VALUES (?,?,?,?, 'active')",
+            [$cpId, $connectorId, $timestamp, $meterStart]
+        );
+    }
+
+    private function handleStopTransaction(array $payload): void
+    {
+        $timestamp     = $payload['timestamp'] ?? date("c");
+        $meterStop     = $payload['meterStop'] ?? 0;
+        $transactionId = $payload['transactionId'] ?? 0;
+
+        $this->db->query(
+            "UPDATE transactions
+             SET stop_time = ?, meter_stop = ?, status = 'finished'
+             WHERE id = ?",
+            [$timestamp, $meterStop, $transactionId]
+        );
+    }
+
+    private function logEventToDatabase(string $type, string $action, array $payload, int $cpId): void
+    {
+        $this->db->query(
+            "INSERT INTO events (message_type, action, payload, chargepoint_id, created_at)
+             VALUES (?,?,?,?,NOW())",
+            [$type, $action, json_encode($payload), $cpId]
+        );
+    }
+
+    public function onClose(ConnectionInterface $conn)
+    {
+        $cpId = $conn->cpId ?? 'UNKNOWN';
+        $this->csmsLog("Konekcija zatvorena (CP-$cpId)");
+    }
+
+    public function onError(ConnectionInterface $conn, \Exception $e)
+    {
+        $cpId = $conn->cpId ?? 'UNKNOWN';
+        $this->csmsLog("Greška na konekciji (CP-$cpId): {$e->getMessage()}");
+    }
+}
+
+$server = IoServer::factory(
+    new HttpServer(
+        new WsServer(
+            new CSMS()
+        )
+    ),
+    9001
+);
+
+echo "CSMS WebSocket server pokrenut na portu 9001\n";
+$server->run();

@@ -1,0 +1,239 @@
+<?php
+
+require __DIR__ . '/../../../vendor/autoload.php';
+use WebSocket\Client;
+
+/* ---------------------------------------------------------
+   CP-ID IZ ARGUMENTA (ID-only)
+--------------------------------------------------------- */
+
+if (!isset($argv[1])) {
+    die("ERROR: ChargePoint ID nije proslijeden. Pokreni: php ChargePoint.php 1\n");
+}
+
+$CHARGE_POINT_ID = intval($argv[1]);
+
+/* ---------------------------------------------------------
+   FILE PATHS (PER CP – po ID-u)
+--------------------------------------------------------- */
+
+$STATE_FILE  = "/var/log/ocpp/charger_state_{$CHARGE_POINT_ID}.txt";
+$STATUS_FILE = "/var/log/ocpp/charger_status_{$CHARGE_POINT_ID}.txt";
+$LOG_FILE    = "/var/log/ocpp/chargepoint_{$CHARGE_POINT_ID}.log";
+
+/* ---------------------------------------------------------
+   LOG
+--------------------------------------------------------- */
+
+function cpLog($msg) {
+    global $LOG_FILE, $CHARGE_POINT_ID;
+    $line = "[" . date("Y-m-d H:i:s") . "][CP {$CHARGE_POINT_ID}] $msg\n";
+    echo $line;
+    @file_put_contents($LOG_FILE, $line, FILE_APPEND);
+}
+
+/* ---------------------------------------------------------
+   STATUS FUNKCIJE
+--------------------------------------------------------- */
+
+function setChargerStatus(string $status): void {
+    global $STATUS_FILE;
+    @file_put_contents($STATUS_FILE, $status);
+}
+
+function getChargerStatus(): string {
+    global $STATUS_FILE;
+    if (!file_exists($STATUS_FILE)) return "Available";
+    $v = trim(@file_get_contents($STATUS_FILE));
+    return $v !== "" ? $v : "Available";
+}
+
+function isChargerConnected(): bool {
+    global $STATE_FILE;
+    return file_exists($STATE_FILE) && trim(@file_get_contents($STATE_FILE)) === "1";
+}
+
+/* ---------------------------------------------------------
+   SLANJE PORUKA (custom JSON prema CSMS-u)
+--------------------------------------------------------- */
+
+function sendJsonMessage(Client $client, string $action, array $payload): void {
+    $msg = [
+        'messageId' => uniqid('cp_', true),
+        'action'    => $action,
+        'payload'   => $payload,
+    ];
+    $json = json_encode($msg);
+    $client->text($json);
+    cpLog("Sent: $json");
+}
+
+/* ---------------------------------------------------------
+   STATUS / HEARTBEAT / BOOT
+--------------------------------------------------------- */
+
+function sendStatusNotification(Client $client, string $status, string $errorCode = "NoError"): void {
+    global $CHARGE_POINT_ID;
+
+    $payload = [
+        'chargePointId' => $CHARGE_POINT_ID,
+        'connectorId'   => 1,
+        'status'        => $status,
+        'errorCode'     => $errorCode,
+        'timestamp'     => date("c"),
+    ];
+
+    sendJsonMessage($client, 'StatusNotification', $payload);
+}
+
+function sendHeartbeat(Client $client): void {
+    global $CHARGE_POINT_ID;
+
+    $payload = [
+        'chargePointId' => $CHARGE_POINT_ID,
+        'status'        => getChargerStatus(),
+        'timestamp'     => date("c"),
+    ];
+
+    sendJsonMessage($client, 'Heartbeat', $payload);
+}
+
+function sendBootNotification(Client $client): void {
+    global $CHARGE_POINT_ID;
+
+    $payload = [
+        'chargePointId'      => $CHARGE_POINT_ID,
+        'chargePointVendor'  => 'MyVendor',
+        'chargePointModel'   => 'MyModel',
+        'timestamp'          => date("c"),
+    ];
+
+    sendJsonMessage($client, 'BootNotification', $payload);
+}
+
+/* ---------------------------------------------------------
+   OBRADA NAREDBI OD CSMS-a
+--------------------------------------------------------- */
+
+function handleIncomingCommand(Client $client, string $data): void {
+    $json = json_decode($data, true);
+
+    if (!$json) {
+        cpLog("Invalid JSON: $data");
+        return;
+    }
+
+    // OCPP CALLRESULT (array format) – ignoriramo
+    if (isset($json[0]) && $json[0] === 3) {
+        cpLog("CALLRESULT received");
+        return;
+    }
+
+    // JSON format {action, payload}
+    if (isset($json['action'])) {
+        $action  = $json['action'];
+        $payload = $json['payload'] ?? [];
+    }
+    // OCPP CALL format [2, msgId, Action, Payload]
+    elseif (isset($json[2])) {
+        $action  = $json[2];
+        $payload = $json[3] ?? [];
+    } else {
+        cpLog("Unknown command format");
+        return;
+    }
+
+    cpLog("Received command: $action");
+
+    switch ($action) {
+        case "RemoteStartTransaction":
+            setChargerStatus("Charging");
+            sendStatusNotification($client, "Charging");
+            break;
+
+        case "RemoteStopTransaction":
+            setChargerStatus("Available");
+            sendStatusNotification($client, "Available");
+            break;
+
+        case "PauseCharging":
+            setChargerStatus("SuspendedEV");
+            sendStatusNotification($client, "SuspendedEV");
+            break;
+
+        default:
+            cpLog("Unknown command: $action");
+    }
+}
+
+/* ---------------------------------------------------------
+   GLAVNA PETLJA
+--------------------------------------------------------- */
+
+echo "# ChargePoint {$CHARGE_POINT_ID} starting...\n";
+
+// CSMS Ratchet server sluša na portu 9001, path = /<ID>
+$uri = "ws://127.0.0.1:9001/{$CHARGE_POINT_ID}";
+
+do {
+    try {
+        $client = new Client($uri);
+        $client->addMiddleware(new \WebSocket\Middleware\CloseHandler());
+        $client->addMiddleware(new \WebSocket\Middleware\PingResponder());
+
+        cpLog("Connecting to $uri");
+
+        sendBootNotification($client);
+        sendStatusNotification($client, getChargerStatus());
+
+        // HEARTBEAT CHILD
+        if (function_exists('pcntl_fork')) {
+            $pid = pcntl_fork();
+        } else {
+            $pid = -1;
+        }
+
+        if ($pid === 0) {
+            // child – heartbeat loop
+            $lastStatus = getChargerStatus();
+
+            while (true) {
+                sleep(10);
+
+                $connected = isChargerConnected();
+                $status    = getChargerStatus();
+
+                if ($status !== $lastStatus) {
+                    sendStatusNotification($client, $status);
+                    $lastStatus = $status;
+                }
+
+                if ($connected) {
+                    sendHeartbeat($client);
+                }
+            }
+            exit(0);
+        }
+
+        // MAIN LOOP
+        while (true) {
+            $message = $client->receive();
+            if ($message === null) {
+                cpLog("Disconnected");
+                break;
+            }
+
+            $data = $message instanceof \WebSocket\Message\Text
+                ? $message->getContent()
+                : (string)$message;
+
+            cpLog("Received from CSMS: $data");
+            handleIncomingCommand($client, $data);
+        }
+
+    } catch (\Throwable $e) {
+        cpLog("Fatal error: " . $e->getMessage());
+        sleep(5);
+    }
+
+} while (true);

@@ -1,0 +1,247 @@
+<?php
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+
+// Anti-cache
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Pragma: no-cache");
+header("Expires: 0");
+
+// ---------------------------------------------
+// DATABASE CONNECTION
+// ---------------------------------------------
+$pdo = new PDO(
+    "mysql:host=localhost;dbname=ocpp_simulator;charset=utf8mb4",
+    "srajf",
+    "Passw0rd",
+    [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+);
+
+// ---------------------------------------------
+// FILE PATHS
+// ---------------------------------------------
+$stateFile = "/var/log/ocpp/charger_state.txt";
+$statusFile = "/var/log/ocpp/charger_status.txt";
+
+// ---------------------------------------------
+// PROCESS MANAGEMENT
+// ---------------------------------------------
+function countProcesses($name) {
+    $pattern = ($name === "ChargePoint.php") ? "[C]hargePoint.php" :
+               (($name === "csms-react.php") ? "[c]sms-react.php" : $name);
+    return intval(trim(shell_exec("pgrep -f " . escapeshellarg($pattern) . " | wc -l")));
+}
+
+function killExtraProcesses($name) {
+    $pattern = ($name === "ChargePoint.php") ? "[C]hargePoint.php" :
+               (($name === "csms-react.php") ? "[c]sms-react.php" : $name);
+
+    $pids = trim(shell_exec("pgrep -f " . escapeshellarg($pattern)));
+    if (!$pids) return 0;
+
+    $pidList = explode("\n", $pids);
+    $count = count($pidList);
+
+    if ($count <= 1) return 0;
+
+    for ($i = 1; $i < $count; $i++) {
+        shell_exec("kill -9 " . intval($pidList[$i]));
+    }
+
+    return $count - 1;
+}
+
+// ---------------------------------------------
+// AUTO-KILL DUPLICATE PROCESSES
+// ---------------------------------------------
+$warnings = [];
+if ($killedCP = killExtraProcesses("ChargePoint.php")) $warnings[] = "? Ugašeno $killedCP duplih ChargePoint procesa.";
+if ($killedCSMS = killExtraProcesses("csms-react.php")) $warnings[] = "? Ugašeno $killedCSMS duplih CSMS procesa.";
+
+// ---------------------------------------------
+// HANDLE POST ACTIONS
+// ---------------------------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+
+    if (isset($_POST['connect'])) file_put_contents($stateFile, "1");
+    if (isset($_POST['disconnect'])) file_put_contents($stateFile, "0");
+
+    if (isset($_POST['status'])) {
+        $status = $_POST['status'];
+        $script = "/var/www/ocpp-php/src/Examples/v16/status_" . $status . ".php";
+
+        if (file_exists($script)) {
+            exec("php " . escapeshellarg($script) . " >> /var/log/ocpp/index_debug.log 2>&1 &");
+        }
+    }
+
+    if (isset($_POST['start_cp'])) {
+        if (countProcesses("ChargePoint.php") === 0) {
+            exec("nohup php /var/www/ocpp-php/src/Examples/v16/ChargePoint.php > /var/log/ocpp/chargepoint.log 2>&1 &");
+            $warnings[] = "ChargePoint pokrenut.";
+        } else {
+            $warnings[] = "ChargePoint vec radi.";
+        }
+    }
+}
+
+// ---------------------------------------------
+// READ CURRENT STATE
+// ---------------------------------------------
+$connected = file_exists($stateFile) && trim(file_get_contents($stateFile)) === "1";
+$currentStatus = file_exists($statusFile) ? trim(file_get_contents($statusFile)) : "Nepoznato";
+
+$cpCount = countProcesses("ChargePoint.php");
+$csmsCount = countProcesses("csms-react.php");
+
+// ACTIVE TRANSACTION
+$stmt = $pdo->query("
+    SELECT * FROM transactions 
+    WHERE stop_time IS NULL AND chargepoint_id = 1 
+    ORDER BY id DESC LIMIT 1
+");
+$activeTx = $stmt->fetch(PDO::FETCH_ASSOC);
+
+// SoC podaci za graf
+$socData = [];
+$timeData = [];
+
+if ($activeTx) {
+    $stmtSoc = $pdo->prepare("
+        SELECT timestamp, soc 
+        FROM charging_curve 
+        WHERE transaction_id = ? 
+        ORDER BY id ASC
+    ");
+    $stmtSoc->execute([$activeTx['id']]);
+    $rows = $stmtSoc->fetchAll(PDO::FETCH_ASSOC);
+
+    foreach ($rows as $r) {
+        $timeData[] = $r['timestamp'];
+        $socData[] = (int)$r['soc'];
+    }
+}
+
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ChargePoint Kontrolna ploca</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        h1 { color: #2c3e50; }
+        .btn { padding: 10px 20px; margin: 5px; background: #3498db; color: white; border: none; cursor: pointer; text-decoration: none; display: inline-block; }
+        .status { font-weight: bold; }
+        .ok { color: green; }
+        .bad { color: red; }
+        .warn { color: orange; font-weight: bold; }
+        canvas { border: 1px solid #ccc; margin-top: 10px; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+<h1>ChargePoint Kontrolna ploca</h1>
+
+<?php foreach ($warnings as $w): ?>
+    <p class="warn"><?= htmlspecialchars($w) ?></p>
+<?php endforeach; ?>
+
+<h2>Procesi</h2>
+<p>ChargePoint: 
+    <span class="status <?= $cpCount > 0 ? 'ok' : 'bad' ?>">
+        <?= $cpCount > 0 ? "Radi ?" : "Ne radi ?" ?>
+    </span> (<?= $cpCount ?>)
+</p>
+<p>CSMS: 
+    <span class="status <?= $csmsCount > 0 ? 'ok' : 'bad' ?>">
+        <?= $csmsCount > 0 ? "Radi ?" : "Ne radi ?" ?>
+    </span> (<?= $csmsCount ?>)
+</p>
+
+<form method="post" style="display:inline;">
+    <button class="btn" name="start_cp">Pokreni ChargePoint</button>
+</form>
+
+<form method="post" style="display:inline;">
+    <?= $connected ? '<button class="btn" name="disconnect">Odspoji</button>' : '<button class="btn" name="connect">Spoji</button>' ?>
+</form>
+
+<h2>Simuliraj StatusNotification</h2>
+<?php foreach (["Available","Charging","Preparing","Finishing","SuspendedEVSE","SuspendedEV","Reserved","Unavailable","Faulted"] as $s): ?>
+    <form method="post" style="display:inline;">
+        <input type="hidden" name="status" value="<?= $s ?>">
+        <button class="btn"><?= $s ?></button>
+    </form>
+<?php endforeach; ?>
+
+<p>Trenutni status: 
+    <span class="status <?= in_array($currentStatus, ['Available','Charging']) ? 'ok' : 'bad' ?>">
+        <?= htmlspecialchars($currentStatus) ?>
+    </span>
+</p>
+
+<h2>Transakcija</h2>
+<?php if ($activeTx): ?>
+    <p class="status ok">?? Punjenje aktivno</p>
+    <p>Transakcija ID: <?= htmlspecialchars($activeTx['id']) ?></p>
+    <p>Connector: <?= htmlspecialchars($activeTx['connector_id']) ?></p>
+    <p>Pocetak: <?= htmlspecialchars($activeTx['start_time']) ?></p>
+<?php else: ?>
+    <p class="status bad">? Nema aktivne transakcije</p>
+<?php endif; ?>
+
+<h2>Graf punjenja (SoC %)</h2>
+<canvas id="socChart" width="600" height="300"></canvas>
+
+<h2>Logovi</h2>
+<a href="logovi_punionica.php" class="btn">Otvori logove</a>
+
+<script>
+const socLabels = <?= json_encode($timeData) ?>;
+const socValues = <?= json_encode($socData) ?>;
+
+const ctx = document.getElementById('socChart').getContext('2d');
+
+const socChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: socLabels,
+        datasets: [{
+            label: 'State of Charge (%)',
+            data: socValues,
+            borderColor: 'green',
+            backgroundColor: 'rgba(0, 255, 0, 0.2)',
+            tension: 0.3,
+            pointRadius: 2
+        }]
+    },
+    options: {
+        responsive: true,
+        scales: {
+            y: {
+                beginAtZero: true,
+                max: 100,
+                title: {
+                    display: true,
+                    text: 'SoC (%)'
+                }
+            },
+            x: {
+                title: {
+                    display: true,
+                    text: 'Vrijeme'
+                }
+            }
+        }
+    }
+});
+
+// Auto refresh svakih 5 sekundi
+setInterval(() => {
+    window.location.href = "index.php?rnd=" + Math.random();
+}, 5000);
+</script>
+
+</body>
+</html>
