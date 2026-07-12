@@ -1,0 +1,73 @@
+<?php
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+
+function tailFile($file, $lines = 20) {
+    return shell_exec("tail -n " . intval($lines) . " " . escapeshellarg($file));
+}
+
+$cpLog = tailFile("/var/log/ocpp/chargepoint.log", 20);
+$csmsLog = tailFile("/var/www/ocpp-php/src/Examples/v16/csms.log", 20);
+
+// HASH za auto-refresh
+$hash = md5($cpLog . $csmsLog);
+
+if (isset($_GET['ajax'])) {
+    echo json_encode([
+        "hash" => $hash,
+        "cp" => $cpLog,
+        "csms" => $csmsLog
+    ]);
+    exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($_POST['clear_cp'])) exec("truncate -s 0 /var/log/ocpp/chargepoint.log");
+    header("Location: logovi_punionica.php");
+    exit;
+}
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Logovi punionica</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        pre { background: #f4f4f4; padding: 10px; border: 1px solid #ccc; max-height: 500px; overflow-y: scroll; }
+        .btn { padding: 10px 20px; margin: 5px; background: #3498db; color: white; border: none; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+<h1>Logovi punionica</h1>
+
+<h2>ChargePoint log (zadnjih 20 linija)</h2>
+<pre id="cpLog"><?= htmlspecialchars($cpLog) ?></pre>
+<form method="post"><button class="btn" name="clear_cp">Obriši ChargePoint log</button></form>
+
+<h2>CSMS log (zadnjih 20 linija)</h2>
+<pre id="csmsLog"><?= htmlspecialchars($csmsLog) ?></pre>
+
+<p><a href="index.php" class="btn">Natrag</a></p>
+
+<script>
+let lastHash = "<?= $hash ?>";
+
+function refreshLogs() {
+    fetch("logovi_punionica.php?ajax=1")
+        .then(r => r.json())
+        .then(data => {
+            if (data.hash !== lastHash) {
+                document.getElementById("cpLog").textContent = data.cp;
+                document.getElementById("csmsLog").textContent = data.csms;
+                lastHash = data.hash;
+            }
+        })
+        .catch(err => console.error(err));
+}
+
+setInterval(refreshLogs, 2000);
+</script>
+
+</body>
+</html>

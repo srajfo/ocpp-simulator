@@ -1,0 +1,158 @@
+<?php
+require_once 'config.php';
+require_once 'helper_functions.php';
+requireLogin();
+
+$mysqli = new mysqli("localhost", "srajf", "Passw0rd", "ocpp_system");
+$sim    = new mysqli("localhost", "srajf", "Passw0rd", "ocpp_simulator");
+
+$mysqli->set_charset("utf8mb4");
+$sim->set_charset("utf8mb4");
+
+$uid = $_SESSION['user_id'];
+
+/* -----------------------------
+   ADMIN PRAVA
+------------------------------ */
+$rights = getUserRights($uid);
+$hasAdminRights = false;
+
+foreach ($rights as $r) {
+    if (is_array($r) && isset($r['OpisPrava'])) {
+        $r = $r['OpisPrava'];
+    }
+    if (!is_string($r)) continue;
+    if (trim($r) !== 'Korisnik') {
+        $hasAdminRights = true;
+        break;
+    }
+}
+
+/* -----------------------------
+   DOHVAT SVIH PUNIONICA
+------------------------------ */
+$stmt = $mysqli->prepare("
+    SELECT p.ID, p.SerijskiBroj, u.Naziv AS Ustanova
+    FROM Punionica p
+    LEFT JOIN Ustanova u ON u.ID = p.ID_Ustanove
+    ORDER BY p.ID ASC
+");
+$stmt->execute();
+$chargers = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+/* -----------------------------
+   STATUS PUNIONICE
+------------------------------ */
+function getCurrentStatus($mysqli, $id) {
+    $stmt = $mysqli->prepare("
+        SELECT s.Naziv
+        FROM Status_Punionice sp
+        JOIN Status s ON s.ID = sp.ID_Status
+        WHERE sp.ID_Punionice = ?
+        ORDER BY sp.VrijemePostavljanja DESC
+        LIMIT 1
+    ");
+    $stmt->bind_param("i", $id);
+    $stmt->execute();
+    $r = $stmt->get_result()->fetch_assoc();
+    return $r ? $r['Naziv'] : null;
+}
+
+/* -----------------------------
+   AKTIVNI KORISNIK
+------------------------------ */
+function getActiveUser($sim, $id) {
+    $stmt = $sim->prepare("
+        SELECT user_id
+        FROM transactions
+        WHERE chargepoint_id = ? AND stop_time IS NULL
+        ORDER BY id DESC
+        LIMIT 1
+    ");
+    $stmt->bind_param("i", $id);
+    $stmt->execute();
+    $r = $stmt->get_result()->fetch_assoc();
+    return $r ? intval($r['user_id']) : null;
+}
+?>
+<!doctype html>
+<html lang="hr">
+<head>
+    <meta charset="utf-8">
+    <title>Odabir punionice</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="scp">
+
+    <!-- Gumbi jedan pored drugog -->
+    <div class="nav-buttons">
+        <?php if ($hasAdminRights): ?>
+            <a href="admin.php" class="logout-btn">Administracija</a>
+        <?php endif; ?>
+        <a href="logout.php" class="logout-btn">Odjava</a>
+    </div>
+
+    <h2>Odaberite punionicu</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Punionica</th>
+                <th>Ustanova</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+
+        <tbody>
+        <?php foreach ($chargers as $c):
+
+            $status = getCurrentStatus($mysqli, $c['ID']);
+            if (!$status) $status = 'Unavailable';
+
+            $activeUser = getActiveUser($sim, $c['ID']);
+
+            /* -----------------------------
+               PRAVILA PRISTUPA
+            ------------------------------ */
+            $canEnter = false;
+
+            if (isAdminSystem($uid)) {
+                $canEnter = true;
+            } elseif (hasRight($uid, 'Administrator ustanove')) {
+                $canEnter = true;
+            } elseif ($status === 'Available') {
+                $canEnter = true;
+            } elseif ($status === 'Charging' && $activeUser === $uid) {
+                $canEnter = true;
+            }
+
+            $link = $canEnter ? "home.php?id=".$c['ID'] : "#";
+        ?>
+            <tr onclick="window.location='<?= $link ?>'">
+                <td data-label="Punionica"><?= esc($c['SerijskiBroj']) ?></td>
+                <td data-label="Ustanova"><?= esc($c['Ustanova']) ?></td>
+
+                <td data-label="Status">
+                    <?php if ($status === 'Available'): ?>
+                        <span class="scp-status-free">Slobodno</span>
+                    <?php elseif ($status === 'Charging'): ?>
+                        <span class="scp-status-busy">Zauzeto</span>
+                    <?php else: ?>
+                        <span class="scp-status-busy"><?= esc($status) ?></span>
+                    <?php endif; ?>
+                </td>
+
+                <td></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+
+    </table>
+
+</div>
+
+</body>
+</html>
